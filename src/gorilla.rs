@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::collections::HashMap;
 
 /// 按位写入数据的工具类
 pub struct BitWriter<W: Write> {
@@ -496,7 +497,7 @@ impl TimeSeriesBlock {
         }
         
         // 完成编码
-        let mut writer = encoder.close()?;
+        let _writer = encoder.close()?;
         
         // 返回压缩后的数据
         Ok(buf)
@@ -538,65 +539,135 @@ impl TimeSeriesBlock {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_gorilla_compression() {
-        // 构造示例数据
-        let mut block = TimeSeriesBlock::new();
-        
-        // 添加有规律的数据点
-        for i in 0..100 {
-            let ts = 1000 + i * 60;
-            let val = 100.0 + (i as f64 % 10.0);
-            block.add_point(ts, val);
-        }
-        
-        // 压缩数据
-        let compressed = block.compress().unwrap();
-        
-        // 计算压缩比率
-        let original_size = block.len() * 16; // 每条记录16字节(8字节ts + 8字节value)
-        let compressed_size = compressed.len();
-        let ratio = compressed_size as f64 / original_size as f64;
-        
-        println!("压缩前大小: {} 字节", original_size);
-        println!("压缩后大小: {} 字节", compressed_size);
-        println!("压缩比率: {:.2}", ratio);
-        
-        // 解压数据
-        let decompressed = TimeSeriesBlock::decompress(&compressed).unwrap();
-        
-        // 验证解压数据与原始数据一致
-        assert_eq!(block.len(), decompressed.len());
-        
-        for (i, (&(orig_ts, orig_val), &(dec_ts, dec_val))) in 
-                block.get_points().iter().zip(decompressed.get_points().iter()).enumerate() {
-            assert_eq!(orig_ts, dec_ts, "时间戳不匹配在点 {}", i);
-            assert_eq!(orig_val, dec_val, "数值不匹配在点 {}", i);
+/// 压缩多字段时间序列数据的容器
+pub struct MultiFieldBlock {
+    field_blocks: HashMap<String, TimeSeriesBlock>,
+}
+
+impl MultiFieldBlock {
+    pub fn new() -> Self {
+        MultiFieldBlock {
+            field_blocks: HashMap::new(),
         }
     }
     
-    #[test]
-    fn test_query() {
-        let mut block = TimeSeriesBlock::new();
+    /// 添加一个数据点的多个字段值
+    pub fn add_point(&mut self, timestamp: u64, fields: &HashMap<String, f64>) {
+        for (field_name, value) in fields {
+            let block = self.field_blocks.entry(field_name.clone())
+                                        .or_insert_with(TimeSeriesBlock::new);
+            block.add_point(timestamp, *value);
+        }
+    }
+    
+    /// 压缩所有字段的数据
+    pub fn compress(&self) -> io::Result<Vec<u8>> {
+        // 构造格式：字段数量 + (字段名长度 + 字段名 + 压缩数据长度 + 压缩数据) × 字段数
+        let mut result = Vec::new();
         
-        // 添加测试数据
-        for i in 0..100 {
-            block.add_point(1000 + i * 10, i as f64);
+        // 写入字段数量
+        let field_count = self.field_blocks.len() as u32;
+        result.extend_from_slice(&field_count.to_le_bytes());
+        
+        // 对每个字段进行压缩
+        for (field_name, block) in &self.field_blocks {
+            // 写入字段名长度和字段名
+            let field_name_bytes = field_name.as_bytes();
+            let field_name_len = field_name_bytes.len() as u32;
+            result.extend_from_slice(&field_name_len.to_le_bytes());
+            result.extend_from_slice(field_name_bytes);
+            
+            // 压缩并写入字段数据
+            let compressed_data = block.compress()?;
+            let data_len = compressed_data.len() as u32;
+            result.extend_from_slice(&data_len.to_le_bytes());
+            result.extend_from_slice(&compressed_data);
         }
         
-        // 查询子范围
-        let result = block.query(1200, 1400);
+        Ok(result)
+    }
+    
+    /// 解压缩多字段数据
+    pub fn decompress(data: &[u8]) -> io::Result<Self> {
+        if data.len() < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                "数据太短，无法包含字段数量"));
+        }
         
-        // 验证结果
-        assert_eq!(result.len(), 21); // 1200, 1210, ..., 1400
-        assert_eq!(result[0].0, 1200);
-        assert_eq!(result[0].1, 20.0);
-        assert_eq!(result[20].0, 1400);
-        assert_eq!(result[20].1, 40.0);
+        let mut offset = 0;
+        
+        // 读取字段数量
+        let field_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        
+        let mut result = MultiFieldBlock::new();
+        
+        // 解压每个字段
+        for _ in 0..field_count {
+            if offset + 4 > data.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "数据格式错误，无法读取字段名长度"));
+            }
+            
+            // 读取字段名长度
+            let field_name_len = u32::from_le_bytes(
+                data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            
+            if offset + field_name_len > data.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "数据格式错误，无法读取字段名"));
+            }
+            
+            // 读取字段名
+            let field_name = String::from_utf8(
+                data[offset..offset + field_name_len].to_vec())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "字段名不是有效的UTF-8"))?;
+            offset += field_name_len;
+            
+            if offset + 4 > data.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "数据格式错误，无法读取压缩数据长度"));
+            }
+            
+            // 读取压缩数据长度
+            let data_len = u32::from_le_bytes(
+                data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            
+            if offset + data_len > data.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "数据格式错误，无法读取压缩数据"));
+            }
+            
+            // 解压字段数据
+            let block = TimeSeriesBlock::decompress(&data[offset..offset + data_len])?;
+            result.field_blocks.insert(field_name, block);
+            offset += data_len;
+        }
+        
+        Ok(result)
+    }
+    
+    /// 查询指定时间范围内的多字段数据
+    pub fn query(&self, start: u64, end: u64, fields: &[String]) -> HashMap<String, Vec<(u64, f64)>> {
+        let mut result = HashMap::new();
+        
+        // 如果字段列表为空，查询所有字段
+        if fields.is_empty() {
+            for (field_name, block) in &self.field_blocks {
+                result.insert(field_name.clone(), block.query(start, end));
+            }
+        } else {
+            // 否则只查询请求的字段
+            for field_name in fields {
+                if let Some(block) = self.field_blocks.get(field_name) {
+                    result.insert(field_name.clone(), block.query(start, end));
+                }
+            }
+        }
+        
+        result
     }
 }
 

@@ -14,6 +14,9 @@ pub enum Error {
     
     #[error("Memory map error: {0}")]
     MemMapError(String),
+    
+    #[error("JSON error: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,155 +1,234 @@
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     fs::{self, File},
-    io::{self, BufWriter, Read, Write},
+    io::{self, BufWriter, Write, Seek},
     path::{Path, PathBuf},
 };
 
-use log::{debug, info};
+use log::{debug, info, error};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::error::{Error, Result};
-use crate::gorilla::TimeSeriesBlock;
-use crate::wal::{Timestamp, Value};
+use crate::gorilla::MultiFieldBlock;
+use crate::types::{DataPoint, SeriesKey, QueryFilter, Timestamp};
 
 /// SSTable文件结构：使用Gorilla压缩和内存映射实现零拷贝读取
 pub struct SSTable {
     pub path: PathBuf,
-    mmap: Option<Mmap>, // 内存映射用于零拷贝
-    min_ts: Timestamp,  // 文件中的最小时间戳
-    max_ts: Timestamp,  // 文件中的最大时间戳
+    mmap: Option<Mmap>, 
+    // 映射到文件中的序列索引，每个序列指向其数据在文件中的位置和长度
+    series_index: HashMap<SeriesKey, (usize, usize)>,
 }
 
 impl SSTable {
-    /// 创建新的SSTable文件，使用Gorilla压缩数据
-    pub fn create(dir: &str, data: &BTreeMap<Timestamp, Value>) -> Result<Self> {
+    /// 创建新的SSTable文件，使用Gorilla压缩存储多个序列的数据
+    pub fn create(dir: &str, data_by_series: &HashMap<SeriesKey, Vec<DataPoint>>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let file_id = chrono::Utc::now().timestamp();
         let path = Path::new(dir).join(format!("sstable-{}.db", file_id));
         
-        // 获取最小和最大时间戳
-        let min_ts = *data.keys().next().unwrap_or(&0);
-        let max_ts = *data.keys().next_back().unwrap_or(&0);
+        // 预处理每个序列的数据为MultiFieldBlock
+        let mut series_blocks: HashMap<SeriesKey, MultiFieldBlock> = HashMap::new();
         
-        // 将数据转换为TimeSeriesBlock
-        let mut block = TimeSeriesBlock::new();
-        for (&ts, &val) in data.iter() {
-            block.add_point(ts, val);
+        for (series_key, data_points) in data_by_series {
+            let mut block = MultiFieldBlock::new();
+            
+            for point in data_points {
+                block.add_point(point.timestamp, &point.fields);
+            }
+            
+            series_blocks.insert(series_key.clone(), block);
         }
-        
-        // 压缩数据
-        let compressed_data = block.compress()?;
         
         // 写入文件
         let mut file = BufWriter::new(File::create(&path)?);
         
-        // 写入元数据：最小TS、最大TS
-        file.write_all(&min_ts.to_le_bytes())?;
-        file.write_all(&max_ts.to_le_bytes())?;
+        // 写入序列数量
+        let series_count = series_blocks.len() as u32;
+        file.write_all(&series_count.to_le_bytes())?;
         
-        // 写入压缩数据长度和数据
-        let compressed_len = compressed_data.len() as u32;
-        file.write_all(&compressed_len.to_le_bytes())?;
-        file.write_all(&compressed_data)?;
+        // 预留序列索引空间，每个序列需要：序列键长度(4) + 序列键 + 位置(8) + 长度(8)
+        let index_start_pos = 4; // 序列数量后的位置
+        let mut curr_pos = index_start_pos;
+        
+        // 估算索引大小，先跳过
+        for (series_key, _) in &series_blocks {
+            // 序列键序列化大小估算：测量名长度(4) + 测量名 + 标签数量(4) + 每个标签(键长度(4) + 键 + 值长度(4) + 值)
+            let key_size = 4 + series_key.measurement.len() + 4 + 
+                series_key.tags.iter().map(|(k, v)| 4 + k.len() + 4 + v.len()).sum::<usize>();
+                
+            curr_pos += key_size + 16; // 16 = 位置(8) + 长度(8)
+        }
+        
+        // 跳到数据开始位置
+        let data_start_pos = curr_pos;
+        file.seek(io::SeekFrom::Start(data_start_pos as u64))?;
+        
+        // 写入每个序列的数据
+        let mut series_positions = HashMap::new();
+        for (series_key, block) in &series_blocks {
+            let start_pos = file.stream_position()? as usize;
+            let compressed_data = block.compress()?;
+            file.write_all(&compressed_data)?;
+            let end_pos = file.stream_position()? as usize;
+            
+            series_positions.insert(series_key.clone(), (start_pos, end_pos - start_pos));
+        }
+        
+        // 回到索引开始位置，写入索引
+        file.seek(io::SeekFrom::Start(index_start_pos as u64))?;
+        
+        for (series_key, (pos, len)) in &series_positions {
+            // 写入序列键
+            let key_bytes = serde_json::to_vec(series_key)?;
+            file.write_all(&(key_bytes.len() as u32).to_le_bytes())?;
+            file.write_all(&key_bytes)?;
+            
+            // 写入位置和长度
+            file.write_all(&(*pos as u64).to_le_bytes())?;
+            file.write_all(&(*len as u64).to_le_bytes())?;
+        }
+        
         file.flush()?;
         
-        let original_size = data.len() * 16; // 每条记录16字节(8字节ts + 8字节value)
+        // 计算总数据量和压缩率
+        let total_points: usize = data_by_series.values().map(|points| points.len()).sum();
+        let original_size = total_points * 16; // 每条记录16字节(时间戳8字节 + 值8字节)的简单估计
+        let compressed_size = series_positions.values().map(|(_, len)| len).sum::<usize>();
+        
         let compression_ratio = if original_size > 0 {
-            compressed_data.len() as f64 / original_size as f64
+            compressed_size as f64 / original_size as f64
         } else {
             0.0
         };
         
-        info!("生成压缩SSTable文件: {:?}, 压缩率: {:.2}, 原始大小: {}字节, 压缩后: {}字节", 
-              path, compression_ratio, original_size, compressed_data.len());
+        info!("生成压缩SSTable文件: {:?}, 包含{}个序列, {}条数据点, 压缩率: {:.2}, 压缩后: {}字节", 
+              path, series_blocks.len(), total_points, compression_ratio, compressed_size);
         
-        let sstable = SSTable {
+        // 创建SSTable对象
+        Ok(SSTable {
             path,
             mmap: None,
-            min_ts,
-            max_ts,
-        };
-        
-        Ok(sstable)
+            series_index: series_positions,
+        })
     }
     
-    /// 打开现有的SSTable文件，使用内存映射实现零拷贝访问
+    /// 打开现有的SSTable文件，读取元数据和索引
     pub fn open(path: PathBuf) -> Result<Self> {
         let file = File::open(&path)?;
-        
-        // 读取元数据
-        let mut reader = io::BufReader::new(&file);
-        let mut buf = [0u8; 8];
-        
-        reader.read_exact(&mut buf)?;
-        let min_ts = u64::from_le_bytes(buf);
-        
-        reader.read_exact(&mut buf)?;
-        let max_ts = u64::from_le_bytes(buf);
-        
-        // 使用内存映射实现零拷贝
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         
-        info!("打开SSTable文件: {:?}, 时间范围: [{}, {}]", path, min_ts, max_ts);
+        if mmap.len() < 4 {
+            return Err(Error::DataError("SSTable文件格式错误: 太小".to_string()));
+        }
+        
+        // 读取序列数量
+        let series_count = u32::from_le_bytes(mmap[0..4].try_into().unwrap()) as usize;
+        
+        // 读取序列索引
+        let mut offset = 4;
+        let mut series_index = HashMap::new();
+        
+        for _ in 0..series_count {
+            if offset + 4 > mmap.len() {
+                return Err(Error::DataError("SSTable索引不完整".to_string()));
+            }
+            
+            // 读取序列键长度
+            let key_len = u32::from_le_bytes(mmap[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            
+            if offset + key_len + 16 > mmap.len() {
+                return Err(Error::DataError("SSTable索引损坏".to_string()));
+            }
+            
+            // 读取序列键
+            let series_key: SeriesKey = serde_json::from_slice(&mmap[offset..offset+key_len])?;
+            offset += key_len;
+            
+            // 读取位置和长度
+            let pos = u64::from_le_bytes(mmap[offset..offset+8].try_into().unwrap()) as usize;
+            offset += 8;
+            
+            let len = u64::from_le_bytes(mmap[offset..offset+8].try_into().unwrap()) as usize;
+            offset += 8;
+            
+            series_index.insert(series_key, (pos, len));
+        }
+        
+        info!("打开SSTable文件: {:?}, 包含{}个序列", path, series_count);
         
         Ok(SSTable {
             path,
             mmap: Some(mmap),
-            min_ts,
-            max_ts,
+            series_index,
         })
     }
     
     /// 判断查询区间是否与当前文件有交集
     pub fn may_contain(&self, start: Timestamp, end: Timestamp) -> bool {
-        !(end < self.min_ts || start > self.max_ts)
+        true  // 简化版实现，默认可能包含
     }
 
-    /// 查询区间数据，使用零拷贝技术
-    pub fn query(&self, start: Timestamp, end: Timestamp) -> Result<Vec<(Timestamp, Value)>> {
-        let mut results = Vec::new();
+    /// 查询满足过滤条件的数据
+    pub fn query(&self, filter: &QueryFilter) -> Result<HashMap<SeriesKey, HashMap<String, Vec<(Timestamp, f64)>>>> {
+        let (start_time, end_time) = filter.time_range;
+        let mut results = HashMap::new();
         
-        // 检查区间是否有交集
-        if !self.may_contain(start, end) {
-            return Ok(results);
-        }
-        
-        // 懒加载mmap，如果没有初始化，则进行加载
         let mmap = match &self.mmap {
             Some(m) => m,
-            None => {
-                return Err(Error::MemMapError(
-                    "SSTable未加载到内存映射".to_string(),
-                ));
+            None => return Err(Error::MemMapError("SSTable未加载到内存映射".to_string())),
+        };
+        
+        // 遍历索引，查找匹配的序列
+        for (series_key, (pos, len)) in &self.series_index {
+            // 如果有指定测量名，检查是否匹配
+            if let Some(ref measurement) = filter.measurement {
+                if series_key.measurement != *measurement {
+                    continue;
+                }
             }
-        };
-        
-        if mmap.len() < 20 {
-            return Err(Error::DataError("SSTable文件格式错误".to_string()));
+            
+            // 检查标签是否匹配
+            let mut match_tags = true;
+            for (tag_key, tag_value) in &filter.tags {
+                match series_key.tags.get(tag_key) {
+                    Some(value) if value == tag_value => continue,
+                    _ => {
+                        match_tags = false;
+                        break;
+                    }
+                }
+            }
+            
+            if !match_tags {
+                continue;
+            }
+            
+            // 检查数据是否在范围内
+            if *pos + *len > mmap.len() {
+                return Err(Error::DataError("SSTable数据指针超出文件范围".to_string()));
+            }
+            
+            // 读取和解压序列数据
+            let data = &mmap[*pos..*pos + *len];
+            let multi_block = match MultiFieldBlock::decompress(data) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("解压序列数据失败: {:?}", e);
+                    continue;
+                }
+            };
+            
+            // 查询符合时间范围的数据点
+            let field_results = multi_block.query(start_time, end_time, &filter.fields);
+            
+            if !field_results.is_empty() {
+                results.insert(series_key.clone(), field_results);
+            }
         }
         
-        // 读取元数据和压缩数据
-        let _min_ts = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
-        let _max_ts = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
-        let compressed_len = u32::from_le_bytes(mmap[16..20].try_into().unwrap()) as usize;
-        
-        if 20 + compressed_len > mmap.len() {
-            return Err(Error::DataError("压缩数据长度超出文件大小".to_string()));
-        }
-        
-        // 零拷贝方式访问压缩数据 - 直接从内存映射中读取，不复制
-        let compressed_data = &mmap[20..20 + compressed_len];
-        
-        // 解压并查询
-        let block = match TimeSeriesBlock::decompress(compressed_data) {
-            Ok(b) => b,
-            Err(e) => return Err(Error::CompressionError(format!("解压失败: {}", e))),
-        };
-        
-        // 查询指定区间
-        results = block.query(start, end);
-        
-        debug!("SSTable查询 {:?} 返回 {} 条数据", self.path, results.len());
+        debug!("SSTable查询返回 {} 个匹配序列", results.len());
         Ok(results)
     }
 }

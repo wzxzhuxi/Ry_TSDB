@@ -4,20 +4,20 @@ mod gorilla;
 mod sstable;
 mod wal;
 mod server;
+mod types;
 
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 use log::info;
 use db::{DbConfig, SimpleTSDB};
-use server::TsdbServer;
-use std::sync::Arc;
+use crate::server::TsdbServer;
+use crate::types::DataPoint;
 
 #[tokio::main]
 async fn main() -> error::Result<()> {
     // 初始化日志系统
     env_logger::init();
     
-    info!("启动LSM-Tree TSDB（Gorilla压缩 + 零拷贝技术）");
+    info!("启动支持标签和多字段数据的LSM-Tree TSDB（Gorilla压缩 + 零拷贝技术）");
     
     // 配置数据库
     let config = DbConfig {
@@ -27,78 +27,77 @@ async fn main() -> error::Result<()> {
     };
     
     // 打开数据库
-    let db = SimpleTSDB::open(config)?;
+    let db = Arc::new(SimpleTSDB::open(config)?);
     
     // 写入示例数据
     write_sample_data(&db)?;
     
-    // 等待后台刷盘
-    thread::sleep(Duration::from_secs(1));
-    
-    // 查询示例
-    let base_ts = 1622000000;
-    query_example(&db, base_ts)?;
-    
-    // 输出统计信息
-    let stats = db.get_stats()?;
-    info!("数据库统计: {} 个SSTable文件, 磁盘占用: {} 字节, MemTable记录数: {}", 
-    stats.sstable_count, stats.total_disk_size, stats.memtable_records);
-    
-    // 创建并启动服务器，监听6364端口
-    let server = TsdbServer::new(Arc::new(db), "127.0.0.1:6364".to_string());
+    // 创建并启动服务器
+    let server = TsdbServer::new(db, "127.0.0.1:6364".to_string());
     info!("服务器将在 127.0.0.1:6364 监听请求");
     
-    // 启动服务器（这会阻塞主线程）
+    // 启动服务器
     server.run().await?;
-
+    
     Ok(())
 }
 
 fn write_sample_data(db: &SimpleTSDB) -> error::Result<()> {
-    let base_ts = 1622000000;
-    
-    // 写入一些规律的CPU数据
     info!("写入示例数据...");
+    
+    // 写入CPU监控数据
+    for i in 0..50 {
+        let ts = 1622000000 + i * 60;
+        
+        // CPU数据，带有标签和多个字段
+        let mut cpu_point = DataPoint::new(ts);
+        cpu_point.add_tag("host", "server1")
+                 .add_tag("region", "us-west")
+                 .add_field("usage", 25.0 + (i as f64 % 10.0))
+                 .add_field("idle", 75.0 - (i as f64 % 10.0))
+                 .add_field("system", 10.0 + (i as f64 * 0.1));
+                 
+        db.write_point("cpu", cpu_point)?;
+        
+        // 内存数据，不同标签组合
+        let mut mem_point = DataPoint::new(ts);
+        mem_point.add_tag("host", "server1")
+                 .add_tag("region", "us-west")
+                 .add_field("used", 8192.0 + (i as f64 * 10.0))
+                 .add_field("free", 16384.0 - (i as f64 * 10.0))
+                 .add_field("cached", 4096.0 + (i as f64 * 5.0));
+                 
+        db.write_point("memory", mem_point)?;
+        
+        // 不同主机的CPU数据
+        let mut cpu_point2 = DataPoint::new(ts);
+        cpu_point2.add_tag("host", "server2")
+                  .add_tag("region", "eu-central")
+                  .add_field("usage", 15.0 + (i as f64 % 8.0))
+                  .add_field("idle", 85.0 - (i as f64 % 8.0))
+                  .add_field("system", 8.0 + (i as f64 * 0.05));
+                  
+        db.write_point("cpu", cpu_point2)?;
+    }
+    
+    // 批量写入网络数据
+    let mut network_points = Vec::new();
     for i in 0..100 {
-        db.put(base_ts + i * 60, 25.0 + (i as f64 % 10.0))?;
+        let ts = 1622000000 + i * 30;
+        
+        let mut point = DataPoint::new(ts);
+        point.add_tag("host", "server1")
+             .add_tag("interface", "eth0")
+             .add_field("tx_bytes", 1024.0 * (1.0 + i as f64 * 0.02))
+             .add_field("rx_bytes", 2048.0 * (1.0 + i as f64 * 0.03))
+             .add_field("errors", if i % 10 == 0 { 1.0 } else { 0.0 });
+             
+        network_points.push(point);
     }
     
-    // 批量写入一些内存数据
-    let mut batch = Vec::new();
-    for i in 0..200 {
-        batch.push((base_ts + 3000 + i * 30, 8192.0 + (i as f64 * 10.0)));
-    }
-    db.batch_put(&batch)?;
+    db.write_points("network", network_points)?;
     
-    info!("写入完成，总计 {} 条记录", 100 + batch.len());
-    Ok(())
-}
-
-fn query_example(db: &SimpleTSDB, base_ts: u64) -> error::Result<()> {
-    // 查询CPU数据
-    info!("查询CPU数据区间...");
-    let results = db.query(base_ts, base_ts + 3000)?;
-    println!("CPU数据查询结果（前10条）：");
-    for (i, (ts, val)) in results.iter().take(10).enumerate() {
-        println!("#{}: ts: {}, value: {}", i+1, ts, val);
-    }
-    
-    // 查询内存数据
-    info!("查询内存数据区间...");
-    let results = db.query(base_ts + 3000, base_ts + 5000)?;
-    println!("\n内存数据查询结果（前10条）：");
-    for (i, (ts, val)) in results.iter().take(10).enumerate() {
-        println!("#{}: ts: {}, value: {}", i+1, ts, val);
-    }
-    
-    // 查询混合区间
-    info!("查询混合区间...");
-    let results = db.query(base_ts + 2500, base_ts + 4500)?;
-    println!("\n混合区间查询结果（前10条）：");
-    for (i, (ts, val)) in results.iter().take(10).enumerate() {
-        println!("#{}: ts: {}, value: {}", i+1, ts, val);
-    }
-    
+    info!("写入完成，包含多种序列和字段的示例数据");
     Ok(())
 }
 
